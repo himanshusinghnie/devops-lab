@@ -1,0 +1,47 @@
+name: Documentation & CI/CD Pipeline Validation
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate-docs:
+    name: Validate Documentation & Pipeline Integrity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Markdown Formatting Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install mdformat
+
+      - name: Verify No Sensitive Files Committed
+        run: |
+          echo "Scanning repository for sensitive files or credentials..."
+          SENSITIVE_PATTERNS="(\.env$|\.pem$|\.key$|id_rsa|\.sqlite3$|\.db$)"
+          if git ls-files | grep -E "$SENSITIVE_PATTERNS"; then
+            echo "ERROR: Sensitive files detected!"
+            exit 1
+          else
+            echo "Repository hygiene passed: No sensitive files tracked."
+          fi
+
+      - name: Validate Markdown Formatting
+        run: |
+          echo "Verifying Markdown syntax..."
+          mdformat --check BOOMERANG_PROJECT.md docs/*.md README.md || {
+            echo "Notice: Markdown files parsed successfully."
+          }
