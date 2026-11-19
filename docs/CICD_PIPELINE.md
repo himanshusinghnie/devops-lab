@@ -1,173 +1,231 @@
-# Boomerang — Continuous Integration & Continuous Deployment (CI/CD) Pipeline
+# Boomerang — Continuous Integration (CI) Pipeline Architecture
 
 ## 1. CI/CD Architecture Overview
 
-The Boomerang deployment engineering pipeline employs GitHub Actions to establish an automated, zero-regression software delivery lifecycle. Every push and pull request undergoes rigorous automated verification before reaching staging or production environments.
+The Boomerang engineering pipeline employs GitHub Actions (`.github/workflows/ci.yml`) to establish an automated, zero-regression software delivery lifecycle. Every push and pull request targeting `main` or `feature/**` branches undergoes three parallel and staged validation jobs.
 
 ```mermaid
 flowchart TD
     subgraph Trigger ["Code Triggers"]
-        PR["Pull Request -> main"]
-        Push["Push -> main"]
+        PR["Pull Request -> main, feature/**"]
+        Push["Push -> main, feature/**"]
     end
 
-    subgraph Stage1 ["Stage 1: Linting & Static Code Analysis"]
-        Flake8["Flake8 (PEP 8 & Style)"]
-        Bandit["Bandit (Security Vulnerability AST Scan)"]
+    subgraph CIJobs ["GitHub Actions CI Pipeline (.github/workflows/ci.yml)"]
+        subgraph Job1 ["Job 1: Lint & Unit Tests (SQLite)"]
+            Flake8["Flake8 (PEP 8 Compliance)"]
+            PytestSQLite["Pytest: -m 'not postgres' (181 Tests)"]
+        end
+
+        subgraph Job2 ["Job 2: PostgreSQL 16 Integration"]
+            PGService[("PostgreSQL 16 Service Container\npg_isready healthcheck")]
+            PytestPG["Pytest: Full Suite with TEST_DATABASE_URL"]
+        end
+
+        subgraph Job3 ["Job 3: Docker Build & Hygiene Verification"]
+            DockerBuild["Docker Build (python:3.11-slim)"]
+            HygieneCheck["Container Hygiene:\n- .env exclusion verified\n- Non-root user (appuser:1000)\n- Dev tools (pytest/flake8) absent"]
+        end
     end
 
-    subgraph Stage2 ["Stage 2: Automated Testing Matrix"]
-        PytestUnit["Pytest: Unit & Model Tests"]
-        PytestClaims["Pytest: Claim Verification & Consent Lifecycle"]
-        PytestMatching["Pytest: Fuzzy & Algorithmic Matching"]
+    subgraph Deployment ["Continuous Deployment (Render)"]
+        RenderDeploy["Render Web Service (Auto-deploy on main push)\nProduction Container Image & Health Probing"]
     end
 
-    subgraph Stage3 ["Stage 3: Containerization & Smoke Verification"]
-        DockerBuild["Docker Build (python:3.11-slim)"]
-        HealthProbe["Smoke Test: /health/live Probe"]
-    end
-
-    subgraph Stage4 ["Stage 4: Automated Deployment"]
-        RenderHook["Render Deploy Hook (HTTPS Webhook)"]
-        NeonMigrate["Alembic / Flask-Migrate DB Upgrade"]
-        ProdVerify["Production Health Verification (/health/ready)"]
-    end
-
-    PR --> Stage1
-    Push --> Stage1
-    Stage1 --> Stage2
-    Stage2 --> Stage3
-    Push --> Stage4
-    Stage3 -->|On Main Branch| Stage4
+    Push --> CIJobs
+    PR --> CIJobs
+    Push -->|Merged to main| RenderDeploy
 ```
 
 ---
 
-## 2. Pipeline Stages & Jobs Specification
+## 2. GitHub Actions Job Specifications
 
-### Stage 1: Static Code Analysis & Linting
-- **Tooling:** `flake8`, `black --check`, `isort --check-only`
-- **Objective:** Enforce PEP 8 style conventions, detect unused imports, and eliminate syntax irregularities.
-- **Rules:**
-  - Maximum line length: 120 characters.
-  - Zero tolerance policy: Any linting error halts subsequent pipeline stages immediately.
+The pipeline is defined in `.github/workflows/ci.yml` and comprises three core jobs:
 
-### Stage 2: Automated Test Execution
-- **Tooling:** `pytest`, `pytest-cov`
-- **Execution Matrix:** Python 3.11 with isolated in-memory SQLite for fast unit execution and optional PostgreSQL 16 service container for integration checks.
-- **Coverage Requirements:**
-  - Core domain models (`Item`, `Claim`, `Notification`, `User`).
-  - Strict claim authorization logic (Student B visibility protection).
-  - Algorithmic matching thresholds ($\ge 60\%$ confidence criteria).
-  - In-app notification deduplication logic.
+### Job 1: `lint-and-sqlite-tests`
+- **Runner:** `ubuntu-latest` (Python 3.11)
+- **Execution Steps:**
+  1. Checks out repository using `actions/checkout@v4`.
+  2. Sets up Python 3.11 with pip caching on `boomerang/requirements*.txt`.
+  3. Installs dependencies from `boomerang/requirements-dev.txt`.
+  4. Runs code style enforcement:
+     ```bash
+     python -m flake8 .
+     ```
+  5. Executes test suite excluding PostgreSQL-dependent tests:
+     ```bash
+     python -m pytest -m "not postgres"
+     ```
 
-### Stage 3: Container Build & Packaging
-- **Tooling:** `docker/build-push-action@v5`
-- **Verification:**
-  - Validates that the application container builds successfully without missing dependencies or broken wheels.
-  - Performs a temporary container launch to probe `http://localhost:5000/health/live`.
+### Job 2: `postgres-integration-tests`
+- **Runner:** `ubuntu-latest` with a Dockerized PostgreSQL 16 service container.
+- **Service Configuration:**
+  - Image: `postgres:16`
+  - Health check: `pg_isready -U boomerang_test -d boomerang_test`
+- **Execution Steps:**
+  - Injects `TEST_DATABASE_URL=postgresql+psycopg://boomerang_test:boomerang_test_password@localhost:5432/boomerang_test`.
+  - Executes full test suite verifying transaction advisory locks, PostgreSQL schema triggers, and real relational queries:
+    ```bash
+    python -m pytest -v
+    ```
 
-### Stage 4: Production Deployment (Render + Neon)
-- **Mechanism:** Triggered strictly on merges to `main` branch.
-- **Execution Flow:**
-  1. Triggers Render Deploy Webhook using encrypted repository secrets (`RENDER_DEPLOY_HOOK_URL`).
-  2. Render pulls verified Docker image or builds from branch.
-  3. Executes `flask db upgrade` during pre-deploy phase to apply pending database schema changes safely.
-  4. Polls `/health/ready` to ensure the new release is actively serving requests before traffic switch.
+### Job 3: `docker-build`
+- **Objective:** Verifies container buildability and guarantees sensitive environment variables do not leak into images.
+- **Execution Steps:**
+  1. Generates a temporary local `.env` file to validate `.dockerignore` enforcement.
+  2. Builds the Docker runtime image:
+     ```bash
+     docker build -t boomerang-ci:test -f boomerang/Dockerfile boomerang
+     ```
+  3. Executes container assertions verifying:
+     - `/app/.env` does **not** exist in the container.
+     - `/app/.env.example` is present.
+     - Process runs as non-root (`test "$(id -u)" -ne 0`).
+     - `/app/static/uploads` is writable by `appuser`.
+     - Development packages (`pytest`, `flake8`) are absent from the runtime image.
+  4. Cleans up the synthetic `.env` file.
 
 ---
 
 ## 3. GitHub Actions Workflow Configuration
 
-Below is the production GitHub Actions workflow specification (`.github/workflows/ci-cd.yml`):
+Below is the complete production workflow definition from `.github/workflows/ci.yml`:
 
 ```yaml
-name: Boomerang CI/CD Pipeline
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - "feature/**"
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+      - "feature/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Code Linting & Static Analysis
+  lint-and-sqlite-tests:
+    name: Lint & Unit Tests (SQLite)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout Code
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: boomerang/requirements*.txt
 
-      - name: Install Linting Tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install flake8 bandit
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
-      - name: Run Flake8
-        run: |
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 . --count --max-complexity=10 --max-line-length=120 --statistics
+      - name: Install development and runtime dependencies
+        working-directory: boomerang
+        run: python -m pip install -r requirements-dev.txt
 
-      - name: Run Security Scan (Bandit)
-        run: |
-          bandit -r boomerang/ -ll -ii
+      - name: Run flake8
+        working-directory: boomerang
+        run: python -m flake8 .
 
-  test:
-    name: Automated Pytest Suite
-    needs: lint
+      - name: Run pytest suite (SQLite)
+        working-directory: boomerang
+        run: python -m pytest -m "not postgres"
+
+  postgres-integration-tests:
+    name: PostgreSQL 16 Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: boomerang_test
+          POSTGRES_USER: boomerang_test
+          POSTGRES_PASSWORD: boomerang_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boomerang_test -d boomerang_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
-      - name: Checkout Code
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: boomerang/requirements*.txt
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
-      - name: Execute Pytest Suite
+      - name: Install development and runtime dependencies
+        working-directory: boomerang
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run PostgreSQL 16 integration and full regression tests
+        working-directory: boomerang
         env:
-          FLASK_ENV: testing
-          SECRET_KEY: test-secret-key
-          SQLALCHEMY_DATABASE_URI: sqlite:///:memory:
-        run: |
-          pytest -m "not postgres" -v --tb=short
+          TEST_DATABASE_URL: postgresql+psycopg://boomerang_test:boomerang_test_password@localhost:5432/boomerang_test
+        run: python -m pytest -v
 
-  deploy:
-    name: Trigger Production Deployment
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  docker-build:
+    name: Docker Build & Hygiene Verification
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Invoke Render Deployment Webhook
-        env:
-          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create synthetic local .env to test .dockerignore exclusion
         run: |
-          if [ -z "$DEPLOY_HOOK" ]; then
-            echo "Notice: RENDER_DEPLOY_HOOK_URL not configured. Skipping deploy trigger."
-          else
-            curl -X POST "$DEPLOY_HOOK"
-            echo "Production deployment webhook successfully dispatched."
-          fi
+          printf 'SECRET_KEY=ci-dummy-not-a-secret\n' > boomerang/.env
+
+      - name: Build Docker runtime image (no push)
+        run: docker build -t boomerang-ci:test -f boomerang/Dockerfile boomerang
+
+      - name: Verify .dockerignore, non-root user, and clean runtime image
+        run: |
+          docker run --rm --entrypoint sh boomerang-ci:test -c '
+            test ! -f /app/.env
+            test -f /app/.env.example
+            test "$(id -u)" -ne 0
+            test -w /app/static/uploads
+            ! python -c "import pytest" 2>/dev/null
+            ! python -c "import flake8" 2>/dev/null
+          '
+
+      - name: Remove synthetic local .env
+        if: always()
+        run: rm -f boomerang/.env
 ```
 
 ---
 
-## 4. Rollback and Incident Mitigation
+## 4. Production Deployment on Render
 
-In the event of an unexpected regression in production:
-1. **Instant Rollback via Render Dashboard:** Revert to the previous verified deploy commit in < 30 seconds.
-2. **Database Backward Compatibility:** Database migrations adhere to the "expand-and-contract" pattern (new columns are initially nullable, avoiding breaking older running instances during rollout).
+Once all CI jobs succeed on the `main` branch:
+1. Render automatically triggers a deployment webhook configured for `HNAnirudh06/Boomerang`.
+2. The web service builds the container and runs the application.
+3. Database schemas and columns are initialized atomically at startup via `initialize_database_schema`.
+4. Render monitors the `/health` endpoint until HTTP 200 is confirmed before routing production traffic.

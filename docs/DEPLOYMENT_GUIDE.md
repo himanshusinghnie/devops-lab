@@ -2,7 +2,7 @@
 
 ## 1. Cloud Architecture Overview
 
-Boomerang's production environment is hosted on **Render** (Cloud PaaS) backed by a managed serverless **Neon PostgreSQL 16** database instance.
+Boomerang's live production environment is hosted on **Render** as a web service backed by a managed serverless **Neon PostgreSQL 16** database instance.
 
 ```mermaid
 flowchart LR
@@ -11,96 +11,103 @@ flowchart LR
     end
 
     subgraph RenderPlatform ["Render Cloud Platform"]
-        LoadBalancer["SSL / CDN Edge\n(Automatic Let's Encrypt Cert)"]
-        WebService["Boomerang Web Service\n(Gunicorn WSGI / Python 3.11)\nAuto-scaling & Health Probes"]
-        PersistentDisk["Persistent Disk\n(/app/uploads - 10GB)"]
+        LoadBalancer["SSL / Reverse Proxy\n(ProxyFix: TRUSTED_PROXY_COUNT=1)"]
+        WebService["Boomerang Web Service\n(Gunicorn WSGI / Python 3.11)\nHealth Check: /health"]
+    end
+
+    subgraph StorageServices ["Image Storage Options"]
+        Cloudinary["Cloudinary (Render Free-Tier Persistent Storage)\nIMAGE_STORAGE_BACKEND=cloudinary"]
+        R2["Cloudflare R2 (S3-Compatible Object Storage)\nIMAGE_STORAGE_BACKEND=r2"]
+        LocalDisk["Ephemeral Container Disk (Reset on redeploy)\nIMAGE_STORAGE_BACKEND=local"]
     end
 
     subgraph NeonCloud ["Neon Serverless Cloud"]
-        PgBouncer["Connection Pooler / Proxy\n(SSL mode=require)"]
-        PostgresDB[("PostgreSQL 16 Engine\nCompute Auto-suspend / Resume")]
+        PgBouncer["Connection Pooler (Port 5432 / SSL require)"]
+        PostgresDB[("PostgreSQL 16 Engine\nAdvisory Locks & Immutability Triggers")]
     end
 
-    Users -->|HTTPS / Port 443| LoadBalancer
-    LoadBalancer -->|Reverse Proxy| WebService
-    WebService -->|Persistent Storage| PersistentDisk
-    WebService -->|TCP / SSL Pooler (Port 5432)| PgBouncer
+    Users -->|HTTPS| LoadBalancer
+    LoadBalancer -->|WSGI| WebService
+    WebService -->|psycopg3 pooled connection| PgBouncer
     PgBouncer --> PostgresDB
+    WebService -.->|Uploads & Signed Images| Cloudinary
 ```
 
 ---
 
 ## 2. Environment Variables Configuration
 
-Configure the following environment variables within the Render Dashboard under **Environment Settings**:
+The following environment variables configure the production instance on Render:
 
-| Variable Key | Required | Example / Recommended Value | Description |
+| Variable Key | Required | Value / Example | Description |
 | :--- | :---: | :--- | :--- |
-| `FLASK_ENV` | Yes | `production` | Enables production optimizations and disables debug toolbar |
-| `FLASK_APP` | Yes | `wsgi.py` | Entry point WSGI module |
-| `SECRET_KEY` | Yes | `<64-character-random-hex>` | Cryptographic secret for signing session cookies & CSRF tokens |
-| `DATABASE_URL` | Yes | `postgresql://user:pass@ep-xyz.neon.tech/boomerang?sslmode=require` | Neon PostgreSQL pooled connection URI |
-| `PORT` | Yes | `10000` (Injected automatically by Render) | Dynamic port for Gunicorn HTTP listener |
-| `DB_POOL_SIZE` | No | `10` | Base SQLAlchemy connection pool size |
-| `DB_MAX_OVERFLOW` | No | `20` | Maximum temporary connections above pool size |
-| `DB_POOL_TIMEOUT` | No | `30` | Seconds to wait before timing out on connection pool exhaustion |
-| `DB_POOL_RECYCLE` | No | `1800` | Recycles connections every 30 minutes to prevent stale Neon sockets |
-| `UPLOAD_FOLDER` | Yes | `/app/uploads` | Path to persistent disk for item photo uploads |
-| `MAX_CONTENT_LENGTH`| No | `5242880` (5 MB) | Strict upload size ceiling |
+| `BOOMERANG_ENV` | Yes | `production` | Enables production hardening (forces DEBUG off, enables strict secrets) |
+| `SECRET_KEY` | Yes | `<64-character-random-hex>` | Must be non-default and at least 16 characters for cryptographic session security |
+| `DATABASE_URL` | Yes | `postgresql://user:pass@ep-xyz.neon.tech/boomerang?sslmode=require` | Neon PostgreSQL URI (automatically normalized to `postgresql+psycopg://`) |
+| `PORT` | Auto | `10000` (Injected by Render) | Dynamic port evaluated by Gunicorn listener |
+| `IMAGE_STORAGE_BACKEND` | Yes | `cloudinary` (or `local` / `r2`) | Storage backend strategy for uploaded item photos |
+| `TRUSTED_HOSTS` | Yes | `boomerang-9gwe.onrender.com` | Rejects unauthorized Host headers to prevent cache poisoning |
+| `TRUSTED_PROXY_COUNT` | Yes | `1` | Configures Werkzeug ProxyFix to safely extract HTTPS scheme and client IP |
+| `SESSION_COOKIE_SECURE` | Yes | `true` | Enforces HTTPS-only delivery of session cookies |
+| `CLOUDINARY_CLOUD_NAME` | If cld | `<cloud-name>` | Cloudinary account identifier for persistent storage |
+| `CLOUDINARY_API_KEY` | If cld | `<api-key>` | Cloudinary API key |
+| `CLOUDINARY_API_SECRET` | If cld | `<api-secret>` | Cloudinary API secret |
+| `CLOUDINARY_FOLDER` | If cld | `boomerang` | Namespace folder for uploaded campus photos |
+| `RATE_LIMIT_ENABLED` | No | `true` | Enables proxy-aware sliding-window rate limiting |
 
 ---
 
-## 3. Pre-Deploy Command & Database Migrations
+## 3. Database Schema Initialization & Migrations
 
-Render provides a **Pre-Deploy Command** step that executes inside the freshly built container before routing traffic to it.
+Boomerang utilizes an **atomic application startup schema initializer** (`initialize_database_schema` in `models.py`) rather than requiring manual migration CLIs (such as Alembic or Flask-Migrate).
 
-Set the Pre-Deploy Command to:
-```bash
-python -m flask db upgrade
-```
-
-### Safe Migration Best Practices with Neon:
-1. **Advisory Locking:** Flask-Migrate / Alembic obtains transactional DDL locks to prevent race conditions when multiple workers launch simultaneously.
-2. **Backward Compatibility:** All schema changes must follow the non-destructive principle (new columns default to `nullable=True` or have default values) so that current running containers continue functioning until traffic swings to the new container.
+### Startup Schema Flow
+1. **Advisory Lock Acquisition:** On PostgreSQL, the application acquires a transaction-scoped advisory lock:
+   ```sql
+   SELECT pg_advisory_xact_lock(POSTGRES_INIT_LOCK_ID);
+   ```
+   This prevents concurrent Gunicorn workers from executing racing DDL operations during container startup.
+2. **Table Creation:** Executes SQLAlchemy `metadata.create_all(bind=conn, checkfirst=True)`.
+3. **Idempotent Column Migrations:** Executes safe, non-destructive schema migrations:
+   ```sql
+   ALTER TABLE item ADD COLUMN IF NOT EXISTS contact_number VARCHAR(30);
+   ```
+4. **Immutability Trigger Installation:** Installs database-level triggers enforcing permanent immutability on completed `exchange_record` transactions.
 
 ---
 
-## 4. Web Service Build & Launch Settings
+## 4. Web Service Build & Launch Specification
 
-- **Runtime:** Python 3
 - **Build Command:**
   ```bash
   pip install --upgrade pip && pip install -r requirements.txt
   ```
 - **Start Command:**
   ```bash
-  gunicorn --bind 0.0.0.0:$PORT --workers 3 --threads 2 --timeout 60 wsgi:app
+  gunicorn --config gunicorn.conf.py app:app
   ```
 - **Health Check Path:**
   ```
-  /health/ready
+  /health
   ```
-  *(Render will only shift incoming web traffic to the new instance when `/health/ready` returns HTTP 200)*
+  *(Render continuously probes `/health`, which executes a database `SELECT 1` ping. Traffic is routed only when HTTP 200 is returned)*
 
 ---
 
-## 5. Security & SSL Enforcement
+## 5. College Expo Demonstration Runbook (Cloudflare Quick Tunnel)
 
-1. **Automatic TLS / SSL:** Render automatically provisions and renews Let's Encrypt SSL/TLS certificates.
-2. **Cookie Security Headers:** In `production` mode, the application automatically enforces:
-   - `SESSION_COOKIE_SECURE = True`
-   - `SESSION_COOKIE_HTTPONLY = True`
-   - `SESSION_COOKIE_SAMESITE = 'Lax'`
-3. **HTTP Strict Transport Security (HSTS):** Enforced via response headers to prevent man-in-the-middle protocol downgrade attacks.
-
----
-
-## 6. Post-Deployment Verification Checklist
-
-Once the deployment completes:
-- [ ] Verify HTTP 200 response from `https://boomerang-9gwe.onrender.com/health/ready`.
-- [ ] Confirm authentication works (User login / session registration).
-- [ ] Test Lost Item submission with mandatory contact number.
-- [ ] Test Found Item submission with image upload.
-- [ ] Verify email/notification delivery without duplicates.
-- [ ] Check Render application logs for database connection pooling warnings.
+For campus demos where local laptop databases and images must be shared without deploying to the cloud:
+1. Ensure both Docker containers are running:
+   ```powershell
+   docker compose up -d --build
+   ```
+2. Verify local health check:
+   ```powershell
+   Invoke-RestMethod http://localhost:8000/health
+   # Expected: @{status=ok}
+   ```
+3. Launch Cloudflare Quick Tunnel in a separate terminal:
+   ```powershell
+   cloudflared tunnel --url http://localhost:8000
+   ```
+4. Access the generated `https://<random-words>.trycloudflare.com` URL across demo laptops on campus Wi-Fi.
